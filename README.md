@@ -2,7 +2,9 @@
 
 espn-ffb is a project to query fantasy football data from ESPN's API and persist it in your own database. There is a very basic web component with a few views built using Flask that allows you to self-host your own fantasy football league page.
 
-Until all [raw SQL is converted to ORM](https://github.com/raphattack/espn-ffb/issues/1), this will only work with PostgreSQL, but you can modify the queries in [query.py](espn_ffb/db/query.py) to work with other databases supported by [SQLAlchemy](https://docs.sqlalchemy.org/en/13/core/engines.html).
+It should work with any databases supported by [SQLAlchemy](https://docs.sqlalchemy.org/en/13/dialects/index.html). You can change [config.py](https://github.com/raphattack/espn-ffb/blob/master/espn_ffb/config.py#L4-L7) to your respective database URI.
+
+I have only tested with Postgres and the Docker image will also only work with Postgres.
 
 #### Sample views:
 - Recap - [desktop](sample/images/recap-desktop.png), [mobile](sample/images/recap-mobile.png)
@@ -15,7 +17,7 @@ Until all [raw SQL is converted to ORM](https://github.com/raphattack/espn-ffb/i
 
 Two modes are supported:
 * Run with Docker (easiest)
-* Run locally (requires PostgreSQL instance)
+* Run locally (requires database instance)
 
 # Pre-requisites:
 
@@ -40,6 +42,17 @@ To find your `swid` and `espn_s2` in Chrome, go to **DevTools > Application > Co
 
 # Run with Docker
 
+### Windows Users
+There is a [known issue](https://forums.docker.com/t/data-directory-var-lib-postgresql-data-pgdata-has-wrong-ownership/17963/31) with mounted volumes on Docker Desktop, so there are a couple additional steps to take.
+
+1. Rename `docker-compose.yml.windows` to `docker-compose.yml`.
+2. Create the docker volume **pgdata**.
+   ```bash
+   docker volume create --name=pgdata
+   ```
+
+Tested and working fine on Windows 10 with [PowerShell 7.0.3](https://github.com/PowerShell/PowerShell/releases/tag/v7.0.3) and [Docker Desktop 2.3.0.5 48029](https://www.docker.com/products/docker-desktop).
+
 ### Set up .env file
 ```bash
 cp .env.sample .env
@@ -57,12 +70,12 @@ Open browser to http://localhost:5000.
 ### Set up database
 To set up the database the first time, you can run the following command:
 ```bash
-docker-compose run espn-ffb sh ./setup.sh
+docker-compose exec espn-ffb sh setup.sh
 ```
 
 ### Update
 ```bash
-docker-compose run espn-ffb sh ./update.sh
+docker-compose exec espn-ffb sh update.sh
 ```
 
 If you are running with Docker, stop here.
@@ -123,3 +136,4 @@ python3 -m espn_ffb.scripts.generate_recap -e {dev|prod} -y {year} -w {week}
 # Contributors
 
 * [yorch](https://github.com/yorch) - Thank you for the Docker support!
+* [smfarrelly](https://github.com/smfarrelly) - Thank you for your help with converting the raw SQL to ORM!

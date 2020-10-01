@@ -1,13 +1,48 @@
-from collections import namedtuple
 from espn_ffb.db.model.champions import Champions
 from espn_ffb.db.model.matchups import Matchups
 from espn_ffb.db.model.owners import Owners
 from espn_ffb.db.model.records import Records
 from espn_ffb.db.model.sackos import Sackos
 from espn_ffb.db.model.teams import Teams
-from sqlalchemy import desc
+from sqlalchemy import case, desc, func
 from sqlalchemy.dialects.postgresql import insert as pg_insert
-from typing import Sequence
+from typing import Dict, List, NamedTuple, Optional, Set, Sequence
+
+
+# exclude specific owners
+exclude_owners = {
+    "{some_owner_id}"
+}
+
+
+class H2HRecord(NamedTuple):
+    opponent_name: str
+    wins: int
+    losses: int
+
+
+class StandingsRecord(NamedTuple):
+    owner_id: int
+    wins: int
+    losses: int
+    ties: int
+    win_percentage: float
+    points_for: float
+    points_against: float
+    avg_points_for: float
+    avg_points_against: float
+    championships: float
+    sackos: float
+
+
+class WinLossRecord(NamedTuple):
+    wins: int
+    losses: int
+
+
+class WinStreakRecord(NamedTuple):
+    streak: int
+    streak_owner: Optional[int]
 
 
 class Query:
@@ -27,7 +62,7 @@ class Query:
 
         return champions
 
-    def get_distinct_matchup_team_ids(self, year: int):
+    def get_distinct_matchup_team_ids(self, year: int) -> Dict[str, Set[int]]:
         distinct_matchup_team_ids = dict()
         matchups = self.get_matchups(year)
         for matchup in matchups:
@@ -35,13 +70,12 @@ class Query:
                 distinct_matchup_team_ids[matchup.matchup_id] = {matchup.team_id}
             else:
                 if (matchup.opponent_team_id is None) or (
-                        matchup.opponent_team_id not in distinct_matchup_team_ids.get(matchup.matchup_id)):
+                        matchup.opponent_team_id not in distinct_matchup_team_ids[matchup.matchup_id]):
                     distinct_matchup_team_ids[matchup.matchup_id].add(matchup.team_id)
 
         return distinct_matchup_team_ids
 
-    def get_h2h_record_current(self, matchups, year, week):
-        Record = namedtuple('Record', ['wins', 'losses'])
+    def get_h2h_record_current(self, matchups: Sequence[Matchups], year: int, week: int) -> List[WinLossRecord]:
         h2h_record = list()
         for m in matchups:
             wins, losses = 0, 0
@@ -54,68 +88,65 @@ class Query:
                 else:
                     losses += 1
 
-            h2h_record.append(Record(wins, losses))
+            h2h_record.append(WinLossRecord(wins, losses))
 
         return h2h_record
 
-    def get_h2h_records(self, owner_id, is_playoffs):
-        COLUMN_NAMES = ['opponent_name', 'wins', 'losses']
-        Record = namedtuple('H2HRecord', COLUMN_NAMES)
+    def get_h2h_records(self, owner_id: int, is_playoffs: bool) -> List[H2HRecord]:
+        full_name_concat = func.CONCAT(Owners.first_name, ' ', Owners.last_name)
 
-        query = f"""
-        select
-          record.opponent_name as opponent_name,
-          sum(record.wins) as wins,
-          sum(record.losses) as losses
-        from
-          (
-            select
-              m.year,
-              m.matchup_id,
-              (
-                select
-                  concat_ws(' ', o.first_name, o.last_name)
-                from
-                  owners o
-                where
-                  o.id = m.owner_id
-              ) as owner_name,
-              m.owner_id,
-              (
-                select
-                  concat_ws(' ', o.first_name, o.last_name)
-                from
-                  owners o
-                where
-                  o.id = m.opponent_owner_id
-              ) as opponent_name,
-              m.opponent_owner_id,
-              case m.is_win when true then 1 else 0 end as wins,
-              case m.is_loss when true then 1 else 0 end as losses
-            from
-              matchups m
-            where
-              m.is_playoffs = {is_playoffs}
-              and not m.is_consolation
-              and m.owner_id = '{owner_id}'
-              and m.opponent_owner_id is not null
-            group by
-              m.year,
-              m.matchup_id,
-              owner_name,
-              m.owner_id,
-              opponent_name,
-              m.opponent_owner_id,
-              wins,
-              losses
-          ) as record
-        group by
-          record.opponent_name
-        order by
-          opponent_name
-        """
+        owner_name = (
+            self.db.session.query(full_name_concat)
+                .filter(Owners.id == Matchups.owner_id)
+                .label("owner_name")
+        )
 
-        return [Record(**r) for r in self.db.engine.execute(query)]
+        opponent_name = (
+            self.db.session.query(full_name_concat)
+                .filter(Owners.id == Matchups.opponent_owner_id)
+                .label("opponent_name")
+        )
+
+        wins = case([(Matchups.is_win.is_(True), 1)], else_=0).label("wins")
+        losses = case([(Matchups.is_loss.is_(True), 1)], else_=0).label("losses")
+
+        columns = [
+            Matchups.year,
+            Matchups.matchup_id,
+            owner_name,
+            Matchups.owner_id,
+            opponent_name,
+            Matchups.opponent_owner_id,
+            wins,
+            losses,
+        ]
+
+        record_subquery = (
+            self.db.session.query(*columns).filter_by(
+                owner_id=owner_id,
+                is_playoffs=is_playoffs,
+                is_pending=False,
+                is_consolation=False,
+            )
+            .filter(
+                Matchups.opponent_owner_id.isnot(None),
+                Matchups.opponent_owner_id.notin_(exclude_owners)
+            )
+            .group_by(*columns)
+            .subquery()
+        )
+
+        h2h_records_query = (
+            self.db.session.query(
+                record_subquery.c.opponent_name,
+                func.sum(record_subquery.c.wins).label("wins"),
+                func.sum(record_subquery.c.losses).label("losses"),
+            )
+            .group_by(record_subquery.c.opponent_name)
+            .order_by(record_subquery.c.opponent_name)
+        )
+
+        return [H2HRecord(*r) for r in h2h_records_query]
 
     def get_matchup_history(self, owner_id, opponent_owner_id, is_playoffs):
         matchups = self.db.session.query(Matchups) \
@@ -141,134 +172,173 @@ class Query:
             .all()
         return matchups
 
-    def get_owners(self):
+    def get_owners(self, exclude: bool = False):
+        if exclude:
+            return self.db.session.query(Owners).filter(Owners.id.notin_(exclude_owners))
         return self.db.session.query(Owners).all()
 
-    def get_records(self, year: int) -> Sequence[Records]:
+    def get_records(self, year: Optional[int]) -> Sequence[Records]:
         """
-        Select records for a given year.
+        Select records for a given year or all years if year is None.
 
         :param year: the year
         :return: list of records
         """
-        records = self.db.session.query(Records).filter_by(year=year).all()
-        return records
+        records_query = self.db.session.query(Records)
+        if year:
+            records_query = records_query.filter_by(year=year)
+        return records_query.all()
 
+    def get_playoff_matchups(self, year: Optional[int]) -> Sequence[Matchups]:
+        playoff_matchups = self.db.session.query(Matchups)
+        if year:
+            playoff_matchups = playoff_matchups.filter_by(year=year)
+        return playoff_matchups.filter(
+            Matchups.opponent_owner_id.isnot(None),
+            Matchups.is_playoffs.is_(True)).all()
+    
     def get_sacko_current(self):
         sacko = self.db.session.query(Sackos) \
             .order_by(desc(Sackos.year)) \
             .first()
         return sacko
 
-    def get_standings(self, year: int):
-        COLUMN_NAMES = ["owner_id", "wins", "losses", "win_percentage", "points_for", "points_against", "avg_points_for",
-                        "avg_points_against", "championships", "sackos"]
-        Record = namedtuple('Standings', COLUMN_NAMES)
+    def get_standings(self, year: Optional[int] = None, is_playoffs: bool = False) -> List[StandingsRecord]:
+        if is_playoffs:
+            return self.get_playoff_standings(year=year)
+        return self.get_regular_standings(year=year)
 
-        query = f"""
-        select 
-          r.owner_id as owner_id,
-          r.wins as wins,
-          r.losses as losses,
-          case 
-            when (r.wins + r.losses) = 0 
-              then 0 
-            else 
-              round(r.wins::decimal/(r.wins + r.losses) , 4) 
-          end as win_percentage,
-          r.points_for as points_for,
-          r.points_against as points_against,
-          case 
-            when (r.wins + r.losses) = 0 
-              then 0 
-            else 
-              round(r.points_for/(r.wins + r.losses), 2) 
-          end as avg_points_for,
-          case 
-            when (r.wins + r.losses) = 0 
-              then 0 
-            else 
-              round(r.points_against/(r.wins + r.losses), 2) 
-          end as avg_points_against,
-          (select count(1) from champions where owner_id = r.owner_id and year = r.year) as championships,
-          (select count(1) from sackos where owner_id = r.owner_id and year = r.year) as sackos
-        from 
-          records r
-        where 
-          r.year = {year}
-        group by
-          r.year,
-          r.owner_id,
-          r.wins,
-          r.losses,
-          r.points_for,
-          r.points_against
-        order by
-          win_percentage desc,
-          points_for desc
-        """
+    def get_regular_standings(self, year: Optional[int]) -> List[StandingsRecord]:
+        owners = self.get_owners()
+        records = self.get_records(year=year)
 
-        return [Record(**r) for r in self.db.engine.execute(query)]
+        standings = []
+        for owner in owners:
+            if not year:
+                if owner.id in exclude_owners:
+                    continue
 
-    def get_standings_overall(self):
-        COLUMN_NAMES = ["owner_id", "wins", "losses", "win_percentage", "points_for", "points_against", "avg_points_for",
-                        "avg_points_against", "championships", "sackos"]
-        Record = namedtuple('Standings', COLUMN_NAMES)
+            owners_records = [r for r in records if r.owner_id == owner.id]
+            # Skip owner without records. Common when viewing standings for a
+            # year where an owner did not participate.
+            if not owners_records:
+                continue
 
-        query = f"""
-        select
-          r.owner_id as owner_id,
-          sum(r.wins) as wins,
-          sum(r.losses) as losses,
-          case 
-            when (sum(r.wins) + sum(r.losses)) = 0 
-              then 0 
-            else 
-              round(sum(r.wins)::decimal/(sum(r.wins) + sum(r.losses)) , 4) 
-          end as win_percentage,
-          sum(r.points_for) as points_for,
-          sum(r.points_against) as points_against,
-          case 
-            when (sum(r.wins) + sum(r.losses)) = 0 
-              then 0 
-            else 
-              round(sum(r.points_for)/(sum(r.wins) + sum(r.losses)), 2) 
-          end as avg_points_for,
-          case 
-            when (sum(r.wins) + sum(r.losses)) = 0 
-              then 0 
-            else 
-              round(sum(r.points_against)/(sum(r.wins) + sum(r.losses)), 2) 
-          end as avg_points_against,
-          (select count(1) from champions where owner_id = r.owner_id) as championships,
-          (select count(1) from sackos where owner_id = r.owner_id) as sackos
-        from
-          records r
-        group by
-          r.owner_id
-        order by
-          win_percentage desc,
-          avg_points_for desc
-        """
+            wins = sum(r.wins for r in owners_records)
+            losses = sum(r.losses for r in owners_records)
+            ties = sum(r.ties for r in owners_records)
+            total_games = wins + losses + ties
 
-        return [Record(**r) for r in self.db.engine.execute(query)]
+            points_for = sum(r.points_for for r in owners_records)
+            points_against = sum(r.points_against for r in owners_records)
 
-    def get_team_id_to_record(self, year, week):
-        team_id_to_record = dict()
-        Record = namedtuple('Record', ['wins', 'losses'])
+            avg_points_for = float(0)
+            avg_points_against = float(0)
+            win_percentage = float(0)
+            if total_games > 0:
+                win_percentage = float(f"{wins / total_games:.4f}")
+                avg_points_for = float(f"{points_for / total_games:.2f}")
+                avg_points_against = float(f"{points_against / total_games:.2f}")
+
+            sackos_query = self.db.session.query(Sackos).filter_by(owner_id=owner.id)
+            champions_query = self.db.session.query(Champions).filter_by(owner_id=owner.id)
+            if year:
+                sackos_query = sackos_query.filter_by(year=year)
+                champions_query = champions_query.filter_by(year=year)
+
+            standings.append(
+                StandingsRecord(
+                    owner.id,
+                    wins,
+                    losses,
+                    ties,
+                    win_percentage,
+                    points_for,
+                    points_against,
+                    avg_points_for,
+                    avg_points_against,
+                    champions_query.count(),
+                    sackos_query.count(),
+                )
+            )
+
+        standings.sort(key=lambda x: (x.win_percentage, x.avg_points_for), reverse=True)
+
+        return standings
+
+    def get_playoff_standings(self, year: Optional[int]) -> List[StandingsRecord]:
+        owners = self.get_owners()
+        matchups = self.get_playoff_matchups(year=year)
+
+        standings = list()
+        for owner in owners:
+            if not year:
+                if owner.id in exclude_owners:
+                    continue
+
+            owner_matchups = [m for m in matchups if m.owner_id == owner.id]
+            # Skip owner without records. Common when viewing standings for a
+            # year where an owner did not participate.
+            if not owner_matchups:
+                continue
+
+            wins = sum(m.is_win for m in owner_matchups)
+            losses = sum(m.is_loss for m in owner_matchups)
+            ties = sum(1 if m.team_score == m.opponent_team_score else 0 for m in owner_matchups)
+            total_games = wins + losses + ties
+
+            points_for = sum(m.team_score for m in owner_matchups)
+            points_against = sum(m.opponent_team_score for m in owner_matchups)
+
+            avg_points_for = float(0)
+            avg_points_against = float(0)
+            win_percentage = float(0)
+            if total_games > 0:
+                win_percentage = float(f"{wins / total_games:.4f}")
+                avg_points_for = float(f"{points_for / total_games:.2f}")
+                avg_points_against = float(f"{points_against / total_games:.2f}")
+
+            sackos_query = self.db.session.query(Sackos).filter_by(owner_id=owner.id)
+            champions_query = self.db.session.query(Champions).filter_by(owner_id=owner.id)
+            if year:
+                sackos_query = sackos_query.filter_by(year=year)
+                champions_query = champions_query.filter_by(year=year)
+
+            standings.append(
+                StandingsRecord(
+                    owner.id,
+                    wins,
+                    losses,
+                    ties,
+                    win_percentage,
+                    points_for,
+                    points_against,
+                    avg_points_for,
+                    avg_points_against,
+                    champions_query.count(),
+                    sackos_query.count(),
+                )
+            )
+
+        standings.sort(key=lambda x: (x.win_percentage, x.avg_points_for), reverse=True)
+
+        return standings
+
+    def get_team_id_to_record(self, year: int, week: int) -> Dict[str, WinLossRecord]:
+        team_id_to_record: Dict[str, WinLossRecord] = dict()
         matchups = self.get_matchups(year)
         for m in matchups:
             if m.team_id in team_id_to_record:
-                r = team_id_to_record.get(m.team_id)
+                r = team_id_to_record[m.team_id]
             else:
-                r = Record(0, 0)
+                r = WinLossRecord(0, 0)
                 team_id_to_record[m.team_id] = r
 
             if m.matchup_id < week:
                 if m.team_score > m.opponent_team_score:
-                    team_id_to_record[m.team_id] = Record(r.wins + 1, r.losses)
+                    team_id_to_record[m.team_id] = WinLossRecord(r.wins + 1, r.losses)
                 if m.team_score < m.opponent_team_score:
-                    team_id_to_record[m.team_id] = Record(r.wins, r.losses + 1)
+                    team_id_to_record[m.team_id] = WinLossRecord(r.wins, r.losses + 1)
 
         return team_id_to_record
 
@@ -286,11 +356,10 @@ class Query:
         teams = self.db.session.query(Teams).filter_by(year=year).all()
         return teams
 
-    def get_win_streak_by_year(self, matchups, year, week):
+    def get_win_streak_by_year(self, matchups: Sequence[Matchups], year: int, week: int) -> List[WinStreakRecord]:
         win_streaks = list()
-        WinStreak = namedtuple('WinStreak', ['streak', 'streak_owner'])
-
         for m in matchups:
+            # noinspection DuplicatedCode
             streak, streak_owner, streak_type = 0, None, None
             h2h_history = [h2h for h2h in self.get_matchup_history(m.owner_id, m.opponent_owner_id, False) if
                            not (h2h.year == year and h2h.matchup_id == week)]
@@ -305,9 +374,18 @@ class Query:
                     break
 
                 streak += 1
-            win_streaks.append(WinStreak(streak, streak_owner))
+            win_streaks.append(WinStreakRecord(streak, streak_owner))
 
         return win_streaks
+
+    def get_distinct_years(self):
+        distinct_matchup_years = (
+            self.db.session.query(Matchups.year)
+                .distinct(Matchups.year)
+                .order_by(Matchups.year.desc())
+        )
+
+        return [matchup.year for matchup in distinct_matchup_years]
 
     def upsert_matchups(self, matchups):
         for m in matchups:
